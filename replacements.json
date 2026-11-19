@@ -46,9 +46,7 @@
     "推音": "推进",
     "发办": "发版",
     "全方面": "全方位",
-    "正常的阐述": "正常地阐述",
-    "手艺": "手艺",
-    "大意": "大意"
+    "正常的阐述": "正常地阐述"
   },
   "regex": {
     "_comment": "Real regex (not escaped literals). Group refs \\1 and $1 both work. Case-insensitive via inline (?i).",

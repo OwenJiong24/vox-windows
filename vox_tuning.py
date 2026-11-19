@@ -2,6 +2,10 @@
 
 IMPORT THIS FIRST — before numpy, before torch, before vox_core.
 
+Note: the public repository is a desensitized mirror of this working tree, kept in sync
+by tools/sync_public.ps1. Edit here, then run the sync script to publish changes.
+
+
 Why this module exists
 ----------------------
 `OMP_NUM_THREADS` / `MKL_NUM_THREADS` are read by the BLAS/OpenMP runtime when it
