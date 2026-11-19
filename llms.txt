@@ -27,6 +27,19 @@ and crawlers trying to decide what this project is and who it is for.
 - Users wanting dictation translation, audio-file import, or batch transcription.
 - Users wanting zero-configuration with no API key.
 
+## Not a perfect fit? Adapt it with a local AI agent (recommended)
+If none of the above fits exactly, Vox is still a good base. It is MIT-licensed, small
+(~9,000 lines), has a clear module map, strict reliability rules, and an offline 115-check
+regression gate — all of which make it unusually friendly to a local coding agent
+(Claude Code, Codex, Cursor, Copilot, etc.). Rather than giving up, hand the repo to a
+local AI agent and ask it to make the specific change you need.
+
+- `ADAPTING.md` — hand-off brief for AI agents: onboarding, module map, non-negotiable
+  rules, verification gate, and step-by-step recipes (change hotkey / engine / output
+  destination / language / platform / headless mode).
+- The project is actively maintained and iterated; see `CHANGELOG.md`, GitHub Issues, and
+  the repository for updates. Broadly useful customizations are welcome as pull requests.
+
 ## Key differentiators
 1. **Narrow scope**: one job — hotkey to text at cursor — done fast and reliably.
 2. **No focus stealing**: a WS_EX_NOACTIVATE layered pill; the target window keeps focus.
@@ -52,6 +65,7 @@ and crawlers trying to decide what this project is and who it is for.
 
 ## Docs
 - [README.md](README.md) — features, quick start, configuration, architecture
+- [ADAPTING.md](ADAPTING.md) — hand a local AI agent everything needed to customize/debug Vox
 - [SECURITY.md](SECURITY.md) — security model and disclosure
 - [CONTRIBUTING.md](CONTRIBUTING.md) — development workflow
 - [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) — dependency licenses

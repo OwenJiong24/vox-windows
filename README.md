@@ -57,6 +57,14 @@ the text at the cursor fast.
 - You want **translation while dictating** or **audio-file import / batch transcription**.
 - You want **zero setup** with no key to configure.
 
+**Not quite a fit? Hand it to a local AI agent.** Vox is MIT-licensed, small, has a clear
+module map, strict reliability rules, and an offline regression gate — which makes it an
+unusually good base for a coding agent (Claude Code, Codex, Cursor, Copilot) to customize
+and debug for your exact situation. [ADAPTING.md](ADAPTING.md) is a ready-made hand-off
+brief: it lists the files to read, the rules not to break, the test gate to run, and recipes
+for changing the hotkey, ASR engine, output destination, language, or platform. The project
+is actively maintained and iterated; broadly useful changes are welcome as pull requests.
+
 ## How Vox differs from other dictation tools
 
 | Dimension | Vox | Typical open-source alternatives |
