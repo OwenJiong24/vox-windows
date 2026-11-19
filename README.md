@@ -109,3 +109,10 @@ redistributing a packaged build.
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+
+## Background
+
+The story behind this open-source release — the secret scan, the zero-history repo,
+and the dependency-license discovery — is written up on OrangeKnows:
+["I open-sourced my dictation tool. The hardest part was not the code."](https://orangeknows.com/essays/2026-11-18-vox-open-source/)
+(中文: [「我把语音输入工具开源了。最难的不是代码。」](https://orangeknows.com/zh/essays/2026-11-18-vox-open-source/)).
