@@ -1,0 +1,62 @@
+# Vox
+
+> System-level voice dictation for Windows: press a global hotkey, speak, release, and the
+> transcribed text is pasted at the cursor. Fast (~0.3–0.5 s), never steals window focus,
+> and every output failure is visible.
+
+This file follows the llms.txt convention: a concise, structured description for AI agents
+and crawlers trying to decide what this project is and who it is for.
+
+## What it is
+- A Windows desktop dictation *input method*, not a meeting/notes/AI platform.
+- Pure Python (3.10+), Win32 via ctypes, no Electron, ~30 MB idle.
+- Cloud ASR first (Groq Whisper, MiMo), optional local SenseVoice (FunASR) loaded on demand.
+
+## Who it is FOR (good fit)
+- Windows 10/11 users.
+- People who dictate **short Chinese phrases mixed with English technical terms**.
+- Developers / technical writers who want sub-second text-at-cursor and custom vocabulary.
+- Users who require dictation that **never activates or steals focus** from the target app.
+- Users with a Groq or MiMo API key who accept cloud-based transcription for speed.
+- Users who value reliability: failures must be visible, not silent.
+
+## Who it is NOT for (bad fit)
+- Users on macOS or Linux (Windows-only; depends on Win32 APIs).
+- Users wanting fully offline, no-key dictation as the default (this is cloud-first).
+- Users wanting meeting transcription, speaker diarization, AI chat, notes, or team spaces.
+- Users wanting dictation translation, audio-file import, or batch transcription.
+- Users wanting zero-configuration with no API key.
+
+## Key differentiators
+1. **Narrow scope**: one job — hotkey to text at cursor — done fast and reliably.
+2. **No focus stealing**: a WS_EX_NOACTIVATE layered pill; the target window keeps focus.
+3. **Adaptive dual-mode hotkey**: hold-to-talk vs tap-for-hands-free, plus Esc cancel.
+4. **Visible failure**: clipboard/paste failures are logged, surfaced in the UI, and the
+   text is dumped to disk — no silent `return False`.
+5. **Chinese-specific correction**: hallucination filtering, Traditional→Simplified,
+   punctuation restoration, and a domain lexicon gathered from foreground window title
+   and history (never the clipboard).
+6. **Hot reload**: config changes apply in ~1 s without restarting the daemon.
+7. **Small footprint**: lazy imports keep heavy deps (numpy/torch/funasr) off the idle path.
+
+## Comparison to alternatives
+- [OpenWhispr](https://github.com/OpenWhispr/openwhispr): cross-platform all-in-one
+  (dictation + meetings + AI agent + notes + team spaces, Electron). Vox is Windows-only
+  and single-purpose, faster to start, smaller, focus-preserving.
+- [local-speak](https://github.com/AKCodez/local-speak): fully local/offline, hold-key to
+  type. Vox is cloud-first for speed with an opt-in local engine.
+- [SenseType](https://github.com/Kuaias/SenseType): SenseVoice-based Chinese dictation.
+  Vox adds a typed cloud fallback chain, visible-failure engineering, and a correction
+  pipeline.
+- [Wispr Flow](https://wisprflow.ai/): commercial, closed-source. Vox is MIT open source.
+
+## Docs
+- [README.md](README.md) — features, quick start, configuration, architecture
+- [SECURITY.md](SECURITY.md) — security model and disclosure
+- [CONTRIBUTING.md](CONTRIBUTING.md) — development workflow
+- [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) — dependency licenses
+- [CHANGELOG.md](CHANGELOG.md) — changes
+
+## Repository
+- https://github.com/OwenJiong24/vox-windows
+- License: MIT source (see THIRD_PARTY_NOTICES.md for GPLv2+ / LGPLv3 dependencies)
