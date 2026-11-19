@@ -1,0 +1,85 @@
+{
+  "hotkey": {
+    "modifiers": ["control", "win"],
+    "key": "",
+    "mode": "adaptive",
+    "combo": "control+win",
+    "hold_threshold_ms": 253
+  },
+  "engine_priority": [
+    "groq-l3",
+    "groq-turbo",
+    "mimo"
+  ],
+  "output_method": "smart_paste",
+  "restore_clipboard": false,
+  "sound_effects": true,
+  "audio": {
+    "sample_rate": 16000,
+    "max_recording_seconds": 300,
+    "upload_format": "flac",
+    "preferred_device": null
+  },
+  "engines": {
+    "groq": {
+      "enabled": true,
+      "model": "whisper-large-v3",
+      "temperature": 0.0,
+      "language": "zh",
+      "api_key": ""
+    },
+    "mimo": {
+      "enabled": true,
+      "model": "mimo-v2.5-asr",
+      "base_url": "https://api.example.com/v1",
+      "language": "zh",
+      "api_key": ""
+    },
+    "sensevoice": {
+      "enabled": true,
+      "model": "iic/SenseVoiceSmall",
+      "device": "cpu",
+      "language": "zh",
+      "use_itn": true,
+      "warmup": false
+    }
+  },
+  "replacements_file": "replacements.json",
+  "history_dir": "history",
+  "streaming": {
+    "enabled": false,
+    "interval_ms": 500,
+    "interim_engine": ""
+  },
+  "context_lexicon": {
+    "enabled": true,
+    "max_terms": 30,
+    "budget_chars": 200
+  },
+  "system": {
+    "auto_start": false
+  },
+  "overlay": {
+    "enabled": true,
+    "position": "bottom_center",
+    "base_width": 520,
+    "base_height": 70,
+    "custom_width": null,
+    "ui": {
+      "font_scale": 1.85,
+      "line_scale": 1.7,
+      "opacity": 90,
+      "done_short_ms": 1500,
+      "done_long_ms": 3500
+    },
+    "custom_x": null,
+    "custom_y": null
+  },
+  "fidelity": {
+    "mode": "verbatim",
+    "auto_period": false
+  },
+  "language": "zh",
+  "whisper_prompt": "用户在讨论软件开发、代码实现、AI与大模型、技术方案的中文口述内容，常夹英文技术术语，比如 Python、JavaScript、Git、API、prompt、token、LLM、Whisper、Groq、CUDA、commit、PR、bug 等。",
+  "test_counter": 0
+}

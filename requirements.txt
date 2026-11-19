@@ -1,0 +1,42 @@
+# Vox (Windows) — dependencies
+#
+# Install into the project venv:
+#   .venv\Scripts\python.exe -m pip install -r requirements.txt
+#
+# NOTE: run.bat / manager.bat launch the project .venv on purpose. A global system
+# interpreter may lack these dependencies, which makes transcription work while
+# clipboard writes and Ctrl+V injection silently fail. Do not point launchers at it.
+
+sounddevice        # audio capture (PortAudio)
+numpy              # array handling
+
+groq               # Groq ASR engine (primary, free tier)
+requests           # MiMo-V2.5-ASR cloud engine
+soundfile          # in-process FLAC encoding (avoids an ffmpeg spawn per take)
+
+keyboard           # low-level global hotkey (hold/release, any app)
+pystray            # tray status indicator (native Windows backend)
+Pillow             # tray icon rendering
+zhconv             # traditional -> simplified Chinese normalization
+
+# Optional: still used by the legacy script-level clipboard test in test_suite.py.
+# Nothing functional needs it any more — clipboard + Ctrl+V run on ctypes (vox_win32).
+pywin32
+
+# ── Local / offline ASR: SenseVoice (FunASR) is the SINGLE retained local engine ─
+#
+# funasr + torch are NOT dead weight and NOT removed. They simply must not be
+# imported or warmed unless the sensevoice family is actually reachable from
+# engine_priority.
+# With the shipped priority (groq-l3 / groq-turbo / mimo) nothing here loads at
+# startup: no torch import, no CUDA probe, no model warmup.
+# Add "sensevoice-cpu" / "sensevoice-cuda" as a Fallback slot in the manager GUI
+# and the engine loads lazily on first use, exactly as before.
+#
+# It is what makes the environment heavy (torch + CUDA wheels ≈ 6.5 GB).
+# If you want the space back without losing the ability to reinstall:
+#   powershell -ExecutionPolicy Bypass -File slim_env.ps1            # dry run
+#   powershell -ExecutionPolicy Bypass -File slim_env.ps1 -Apply     # reclaim
+funasr             # SenseVoice via FunASR (AutoModel) — the one local ASR engine; installs torch
+# torch==2.11.0+cu128   # install from https://download.pytorch.org/whl/cu128
+# torchaudio==2.11.0+cu128  # fbank backend, same index as torch

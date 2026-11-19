@@ -1,0 +1,31 @@
+# ── credentials & runtime config (NEVER commit) ──
+config.json
+vox.pid
+overlay.pid
+vox.gui.restore
+vox.stop
+vox.offload
+vox_rec_backup.wav
+_last_transcript.txt
+
+# ── logs & observed runtime state ──
+*.log
+*.err
+history.db
+vox_perf_history.json
+vox_health.json
+vox_usage.json
+latest.json
+overlay_state.json
+
+# ── temp / caches ──
+__pycache__/
+*.pyc
+.vox-*.tmp
+tmp*/
+vox-atomic-*/
+manual_test.wav
+tmp*.wav.flac
+
+# ── environment ──
+.venv/
