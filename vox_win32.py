@@ -126,6 +126,33 @@ if IS_WINDOWS:
     _user32.SendInput.argtypes = [ctypes.c_uint, ctypes.POINTER(_INPUT), ctypes.c_int]
     _user32.GetAsyncKeyState.restype = ctypes.c_short
     _user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+
+    # Self-built low-level keyboard hook (see KeyboardWatcher). Declaring the
+    # prototypes here keeps the 64-bit HHOOK/HANDLE values intact.
+    _kernel32.GetCurrentThreadId.restype = ctypes.c_ulong
+    _kernel32.GetModuleHandleW.restype = ctypes.c_void_p
+    _kernel32.GetModuleHandleW.argtypes = [ctypes.c_wchar_p]
+    _user32.SetWindowsHookExW.restype = ctypes.c_void_p
+    _user32.SetWindowsHookExW.argtypes = [
+        ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong]
+    _user32.UnhookWindowsHookEx.restype = ctypes.c_int
+    _user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
+    _user32.CallNextHookEx.restype = ctypes.c_long
+    _user32.CallNextHookEx.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_ulong, ctypes.c_void_p]
+    _user32.GetMessageW.restype = ctypes.c_int
+    _user32.GetMessageW.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint]
+    _user32.TranslateMessage.argtypes = [ctypes.c_void_p]
+    _user32.DispatchMessageW.argtypes = [ctypes.c_void_p]
+    _user32.PostThreadMessageW.restype = ctypes.c_int
+    _user32.PostThreadMessageW.argtypes = [
+        ctypes.c_ulong, ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p]
+    _user32.RegisterHotKey.restype = ctypes.c_int
+    _user32.RegisterHotKey.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_uint, ctypes.c_uint]
+    _user32.UnregisterHotKey.restype = ctypes.c_int
+    _user32.UnregisterHotKey.argtypes = [ctypes.c_void_p, ctypes.c_int]
 else:  # pragma: no cover - non-Windows is unsupported but must import cleanly
     _user32 = _kernel32 = None
 
@@ -154,6 +181,69 @@ def available() -> bool:
 
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 STILL_ACTIVE = 259
+
+TOKEN_QUERY = 0x0008
+_TOKEN_INTEGRITY_LEVEL = 25
+_INTEGRITY_NAMES = {
+    0x0000: "Untrusted", 0x1000: "Low", 0x2000: "Medium",
+    0x2100: "Medium-Plus", 0x3000: "High", 0x4000: "System",
+}
+
+
+def integrity_level(pid=None):
+    """Return (rid, name) for a process's integrity level, or (None, reason).
+
+    WHY THIS EXISTS: a process below Medium cannot have its WH_KEYBOARD_LL hook
+    receive keystrokes destined for Medium processes (Chrome, editors, most apps).
+    The symptom is "the global hotkey only works while the Vox window is focused".
+    Reading it for ANOTHER pid is unreliable under UIPI, so the daemon reports its
+    OWN level (pid=None) and the value goes into vox_health.json.
+
+    Uses GetSidSubAuthority instead of manual byte offsets — a hand-rolled offset
+    read returned Low for a Medium process, which sent one investigation the wrong
+    way for an hour.
+    """
+    if not IS_WINDOWS or _kernel32 is None:
+        return None, "non-windows"
+    try:
+        import os as _os
+        target = int(pid) if pid is not None else _os.getpid()
+        adv = ctypes.WinDLL("advapi32", use_last_error=True)
+        adv.OpenProcessToken.argtypes = [
+            ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_void_p)]
+        adv.GetTokenInformation.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_ulong,
+            ctypes.POINTER(ctypes.c_ulong)]
+        adv.GetSidSubAuthorityCount.restype = ctypes.POINTER(ctypes.c_ubyte)
+        adv.GetSidSubAuthorityCount.argtypes = [ctypes.c_void_p]
+        adv.GetSidSubAuthority.restype = ctypes.POINTER(ctypes.c_ulong)
+        adv.GetSidSubAuthority.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+
+        h = _kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, target)
+        if not h:
+            return None, f"OpenProcess err={ctypes.get_last_error()}"
+        try:
+            tok = ctypes.c_void_p()
+            if not adv.OpenProcessToken(h, TOKEN_QUERY, ctypes.byref(tok)):
+                return None, f"OpenProcessToken err={ctypes.get_last_error()}"
+            try:
+                need = ctypes.c_ulong(0)
+                adv.GetTokenInformation(tok, _TOKEN_INTEGRITY_LEVEL, None, 0,
+                                        ctypes.byref(need))
+                buf = ctypes.create_string_buffer(need.value)
+                if not adv.GetTokenInformation(tok, _TOKEN_INTEGRITY_LEVEL, buf,
+                                               need.value, ctypes.byref(need)):
+                    return None, f"GetTokenInformation err={ctypes.get_last_error()}"
+                sid = ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p))[0]
+                cnt = adv.GetSidSubAuthorityCount(sid).contents.value
+                rid = adv.GetSidSubAuthority(sid, cnt - 1).contents.value
+                return rid, _INTEGRITY_NAMES.get(rid & 0xF000, hex(rid))
+            finally:
+                _kernel32.CloseHandle(ctypes.c_void_p(tok.value))
+        finally:
+            _kernel32.CloseHandle(ctypes.c_void_p(h))
+    except Exception as exc:
+        return None, f"error:{exc}"
 
 
 def process_alive(pid) -> bool:
@@ -507,3 +597,451 @@ def resolve_hotkey_vks(tokens):
         else:
             groups.append(())
     return groups
+
+
+# ─── Windows RegisterHotKey (system-level global hotkey) ──────────
+# THE ROBUST PATH (BUG-22). Everything that relies on receiving the raw keystroke
+# — GetAsyncKeyState, WH_KEYBOARD_LL, the `keyboard` package, Raw Input — fails
+# when the process cannot see another process's input (UIPI / integrity level,
+# which is exactly what a sandboxed agent-launched daemon hits). RegisterHotKey
+# does not observe input at all: the SYSTEM owns the chord and posts WM_HOTKEY
+# straight to our thread. Consequences that matter here:
+#   * works regardless of which window is in front;
+#   * works for a Low-integrity process;
+#   * needs a real key (a bare modifier chord like Ctrl+Alt cannot be registered);
+#   * the chord is exclusive while registered;
+#   * it is press-to-fire, not hold — use it for toggle semantics.
+MOD_ALT = 0x0001
+MOD_CONTROL = 0x0002
+MOD_SHIFT = 0x0004
+MOD_WIN = 0x0008
+MOD_NOREPEAT = 0x4000
+WM_HOTKEY = 0x0312
+
+# NOTE (2026-11-18 incident): there is deliberately NO "modifier as the main
+# key" support here anymore. RegisterHotKey accepts such chords and then never
+# fires them; the daemon also suppresses its keyboard hook while a system
+# hotkey is active, so a bogus registration kills the hotkey entirely.
+
+# token -> MOD_* flags
+_HOTKEY_MOD_BITS = {
+    "control": MOD_CONTROL, "ctrl": MOD_CONTROL,
+    "alt": MOD_ALT,
+    "shift": MOD_SHIFT,
+    "win": MOD_WIN, "super": MOD_WIN, "windows": MOD_WIN, "cmd": MOD_WIN,
+}
+
+
+def resolve_register_hotkey(tokens):
+    """['ctrl','alt','space'] -> (modifiers, vk, error).
+
+    Returns error is not None when the chord cannot be registered with
+    RegisterHotKey (notably: no non-modifier key present).
+    """
+    modifiers = 0
+    vk = None
+    for raw in tokens or ():
+        name = str(raw).strip().lower().replace("left ", "").replace("right ", "")
+        if not name:
+            continue
+        if name in _HOTKEY_MOD_BITS:
+            modifiers |= _HOTKEY_MOD_BITS[name]
+            continue
+        if name == "space":
+            vk = VK_SPACE
+        elif name in ("enter", "return"):
+            vk = VK_RETURN
+        elif name in ("esc", "escape"):
+            vk = VK_ESCAPE
+        elif name == "tab":
+            vk = VK_TAB
+        elif len(name) == 1 and name.isalpha():
+            vk = ord(name.upper())
+        elif len(name) == 1 and name.isdigit():
+            vk = 0x30 + int(name)
+        elif name.startswith("f") and name[1:].isdigit() and 1 <= int(name[1:]) <= 24:
+            vk = 0x70 + int(name[1:]) - 1
+        else:
+            return modifiers, None, f"不认识的按键: {raw!r}"
+    if vk is None:
+        # Pure modifier chord (Ctrl+Alt / Win+Ctrl / Ctrl+Shift): REFUSE it.
+        #
+        # 2026-11-18 incident: RegisterHotKey ACCEPTS "mods + modifier-as-vk"
+        # (the call returns success), but the system never dispatches WM_HOTKEY
+        # for it — a modifier arriving is treated as modifier-state change, not
+        # as the chord's main key. Verified the hard way: Ctrl+Alt "registered
+        # successfully" at 19:30, the user pressed it four times at 19:33 and
+        # not one WM_HOTKEY arrived. Worse, while RegisterHotKey is active the
+        # daemon suppresses the hook path, so the hotkey was COMPLETELY dead.
+        # Never register a chord the system cannot fire.
+        return modifiers, None, (
+            "纯修饰键组合不能注册系统热键（RegisterHotKey 会接受注册但永不触发）；"
+            "如需系统热键请加一个真实按键，或留空 register_combo 走键盘钩子")
+    return modifiers, vk, None
+
+
+class HotkeyRegistry:
+    """One global hotkey via RegisterHotKey, owned by a dedicated message thread.
+
+    The thread registers the chord and pumps messages; every WM_HOTKEY bumps
+    `fire_count`, which the daemon polls in its main loop. No callback runs on the
+    message thread, so a slow consumer can never block the system.
+
+        reg = HotkeyRegistry()
+        reg.start(MOD_CONTROL | MOD_ALT, 0x20)     # Ctrl+Alt+Space
+        reg.fire_count                               # increments per press
+        reg.stop()
+    """
+
+    _HOTKEY_ID = 0xB01
+
+    def __init__(self, name="vox-hotkey-registry"):
+        self.name = name
+        self._thread = None
+        self._thread_id = 0
+        self._stop = threading.Event()
+        self._ready = threading.Event()
+        self._modifiers = 0
+        self._vk = 0
+        self.combo = ""
+        self.error = ""
+        self.fire_count = 0
+        self._msg = None
+
+    # ── lifecycle ────────────────────────────────────────────────
+    def start(self, modifiers, vk, combo="", timeout=2.0):
+        if not available():
+            self.error = "Win32 不可用"
+            return False
+        self.stop()
+        self._modifiers = int(modifiers)
+        self._vk = int(vk)
+        self.combo = combo
+        self.error = ""
+        self.fire_count = 0
+        self._stop.clear()
+        self._ready.clear()
+        self._thread = threading.Thread(target=self._run, name=self.name, daemon=True)
+        self._thread.start()
+        self._ready.wait(timeout)
+        return not self.error
+
+    def stop(self):
+        self._stop.set()
+        tid = self._thread_id
+        if tid:
+            try:
+                _user32.PostThreadMessageW(tid, WM_QUIT, None, None)
+            except Exception:
+                pass
+        t = self._thread
+        if t is not None:
+            t.join(timeout=1.0)
+        self._thread = None
+        self._thread_id = 0
+
+    def is_alive(self):
+        t = self._thread
+        return bool(t is not None and t.is_alive())
+
+    # ── internals ────────────────────────────────────────────────
+    def _run(self):
+        try:
+            self._thread_id = int(_kernel32.GetCurrentThreadId())
+            ok = _user32.RegisterHotKey(
+                None, self._HOTKEY_ID, self._modifiers, self._vk)
+            if not ok:
+                err = ctypes.get_last_error()
+                self.error = (f"RegisterHotKey 失败 (err={err})："
+                              f"该组合可能已被其它程序占用")
+                self._ready.set()
+                return
+            self._msg = ctypes.create_string_buffer(64)
+            msg_ptr = ctypes.cast(self._msg, ctypes.c_void_p)
+            self._ready.set()
+            while not self._stop.is_set():
+                r = _user32.GetMessageW(msg_ptr, None, 0, 0)
+                if r == 0 or r == -1:
+                    break
+                # MSG.message is the 3rd field: offset 8 on x64 after HWND.
+                try:
+                    message = ctypes.cast(
+                        ctypes.byref(self._msg, 8 if ctypes.sizeof(ctypes.c_void_p) == 8 else 4),
+                        ctypes.POINTER(ctypes.c_uint))[0]
+                except Exception:
+                    message = 0
+                if message == WM_HOTKEY:
+                    self.fire_count += 1
+        except Exception as exc:
+            self.error = f"热键线程异常: {exc}"
+            self._ready.set()
+        finally:
+            try:
+                _user32.UnregisterHotKey(None, self._HOTKEY_ID)
+            except Exception:
+                pass
+
+
+# ─── Self-healing global keyboard watcher (WH_KEYBOARD_LL) ────────
+# WHY THIS EXISTS (2026-11-18, the "hotkey only works when the Vox window is in
+# front" bug): the daemon used the `keyboard` package's global hook. That package
+# dispatches user callbacks from ONE `processing_thread` whose loop is:
+#
+#     while True:
+#         event = self.queue.get()
+#         if self.pre_process_event(event): self.invoke_handlers(event)
+#
+# and whose error path is `except Exception: traceback.print_exc()`
+# (keyboard/_generic.py:19-26). Under pythonw.exe `sys.stderr` is None, so the
+# moment ANY handler raises, print_exc() itself raises AttributeError, that
+# escapes the un-guarded loop, and the processing thread dies permanently. The
+# OS hook keeps running and keeps filling the queue, but nobody consumes it, so
+# the held-key set freezes and the hotkey stops responding FOREVER — with no
+# error, no log line, and no recovery. That is exactly the reported symptom, and
+# it is why it started failing "after some change".
+#
+# The watcher below removes that dependency on the critical path:
+#   * the hook callback ONLY mutates a set (microseconds, far below the default
+#     300 ms LowLevelHooksTimeout — exceeding that makes Windows silently
+#     remove the hook);
+#   * no file I/O, no logging, no allocation of Python objects beyond ints, and
+#     every branch is exception-guarded, so it can never kill the pump thread;
+#   * the message pump lives on its own thread and is supervised by a watchdog
+#     that reinstalls the hook if the pump ever dies;
+#   * events are passed through (CallNextHookEx), never suppressed, so normal
+#     typing and Win-key chords keep working.
+WH_KEYBOARD_LL = 13
+HC_ACTION = 0
+WM_KEYDOWN = 0x0100
+WM_KEYUP = 0x0101
+WM_SYSKEYDOWN = 0x0104
+WM_SYSKEYUP = 0x0105
+WM_QUIT = 0x0012
+
+# Low-level hooks deliver VK_LCONTROL/VK_RCONTROL (0xA2/0xA3) for the real
+# physical keys rather than VK_CONTROL (0x11), so collapse them onto the
+# canonical code the hotkey groups are built from.
+_CANONICAL_VK = {
+    0xA0: 0x10, 0xA1: 0x10,          # L/R shift -> shift
+    0xA2: 0x11, 0xA3: 0x11,          # L/R ctrl  -> control
+    0xA4: 0x12, 0xA5: 0x12,          # L/R alt   -> menu
+}
+
+
+class _KBDLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [
+        ("vkCode", ctypes.c_ulong),
+        ("scanCode", ctypes.c_ulong),
+        ("flags", ctypes.c_ulong),
+        ("time", ctypes.c_ulong),
+        ("dwExtraInfo", ULONG_PTR),
+    ]
+
+
+class KeyboardWatcher:
+    """Global keyboard state from a self-owned WH_KEYBOARD_LL hook.
+
+    Focus-independent (the hook is system-wide), self-healing, and safe under
+    pythonw (the callback can never raise into the pump).
+
+        watcher = KeyboardWatcher()
+        watcher.start()
+        watcher.keys_all_down([(0x11,), (0x5B, 0x5C)])   # Ctrl + either Win
+        watcher.stop()
+    """
+
+    _POOL_SIZE = 4000   # bound memory if the pump ever wedges
+
+    def __init__(self, name="vox-keyboard-watch"):
+        self.name = name
+        self._down = set()
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = None
+        self._hook = None
+        self._thread_id = 0
+        self._alive = False
+        self._installs = 0
+        self._proc_ref = None       # keep the CFUNCTYPE alive or the hook crashes
+        self._msg = None
+        # WH_KEYBOARD_LL callbacks are delivered on the installing thread while it
+        # pumps messages, so the hook is only USABLE once the pump is inside
+        # GetMessageW. Without this gate start() returned "ready" while the thread
+        # had not reached the loop yet, and any key pressed in that window was lost.
+        self._pumping = threading.Event()
+        # Diagnostic: how many raw key events the hook has seen. If this stops
+        # growing while the user is typing, the OS is not delivering input to
+        # this process (UIPI / elevated-foreground / different desktop).
+        self.event_count = 0
+        # Diagnostic ring of the most recent key codes we saw (vk + up/down).
+        self.recent = []
+
+    # ── lifecycle ────────────────────────────────────────────────
+    def start(self, timeout=2.0):
+        if not available():
+            return False
+        if self._thread is not None and self._thread.is_alive():
+            return True
+        self._stop.clear()
+        self._pumping.clear()
+        self._thread = threading.Thread(
+            target=self._pump_loop, name=self.name, daemon=True)
+        self._thread.start()
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            # Ready == hook installed AND the pump thread is actually looping, so
+            # no keystroke can be lost between start() and the first GetMessageW.
+            if self._alive and self._pumping.is_set():
+                return True
+            time.sleep(0.005)
+        return bool(self._alive)
+
+    def stop(self):
+        self._stop.set()
+        tid = self._thread_id
+        if tid:
+            try:
+                _user32.PostThreadMessageW(tid, WM_QUIT, None, None)
+            except Exception:
+                pass
+        t = self._thread
+        if t is not None:
+            t.join(timeout=1.0)
+        self._thread = None
+        self._alive = False
+        with self._lock:
+            self._down.clear()
+
+    def is_alive(self):
+        t = self._thread
+        return bool(self._alive and t is not None and t.is_alive())
+
+    def reinstall(self):
+        """Force a fresh hook (called by the watchdog when the pump looks dead)."""
+        self.stop()
+        return self.start()
+
+    def watchdog(self, max_age_s=2.0):
+        """One-shot health check used by the daemon's main loop. Returns True if
+        the hook was reinstalled. Cheap: a thread-liveness check."""
+        if self.is_alive():
+            return False
+        return bool(self.start() or self.is_alive())
+
+    # ── state access ─────────────────────────────────────────────
+    def snapshot(self):
+        with self._lock:
+            return set(self._down)
+
+    def is_down(self, vk):
+        with self._lock:
+            return int(vk) in self._down
+
+    def keys_all_down(self, groups):
+        """True when every group has at least one held key (same contract as the
+        module-level keys_all_down, but served from the hook's own state)."""
+        try:
+            with self._lock:
+                down = set(self._down)
+            for group in groups or ():
+                if not any(int(vk) in down for vk in group):
+                    return False
+            return True
+        except Exception:
+            return False
+
+    def install_count(self):
+        return self._installs
+
+    # ── internals ────────────────────────────────────────────────
+    def _pump_loop(self):
+        """Own thread: install the hook, then pump messages until stopped.
+
+        Any failure is contained here (never propagates to the daemon) and leaves
+        _alive False so the watchdog retries.
+        """
+        try:
+            if not self._install():
+                return
+            self._msg = ctypes.create_string_buffer(64)   # MSG is <64 bytes
+            msg_ptr = ctypes.cast(self._msg, ctypes.c_void_p)
+            self._pumping.set()      # hook is live and the loop is about to block
+            while not self._stop.is_set():
+                # Blocks until this thread receives a message.
+                r = _user32.GetMessageW(msg_ptr, None, 0, 0)
+                if r == 0 or r == -1:      # WM_QUIT or error
+                    break
+                _user32.TranslateMessage(msg_ptr)
+                _user32.DispatchMessageW(msg_ptr)
+        except Exception:
+            pass
+        finally:
+            self._uninstall()
+            self._pumping.clear()
+            self._alive = False
+
+    def _install(self):
+        self._thread_id = int(_kernel32.GetCurrentThreadId())
+        HOOKPROC = ctypes.WINFUNCTYPE(
+            ctypes.c_long, ctypes.c_int, ctypes.c_ulong, ctypes.c_void_p)
+        # Keeping a reference is mandatory: if the ctypes thunk is collected the
+        # hook callback points at freed memory and the process crashes.
+        self._proc_ref = HOOKPROC(self._hook_proc)
+        hmod = _kernel32.GetModuleHandleW(None)
+        self._hook = _user32.SetWindowsHookExW(
+            WH_KEYBOARD_LL, ctypes.cast(self._proc_ref, ctypes.c_void_p), hmod, 0)
+        self._alive = bool(self._hook)
+        if self._alive:
+            self._installs += 1
+        return self._alive
+
+    def _uninstall(self):
+        h = self._hook
+        self._hook = None
+        if h:
+            try:
+                _user32.UnhookWindowsHookEx(ctypes.c_void_p(h))
+            except Exception:
+                pass
+
+    def _hook_proc(self, nCode, wParam, lParam):
+        """Runs INSIDE the OS hook. Must never raise, never do I/O, never block.
+
+        Deliberately free of logging: writing to vox.log here would risk the
+        300 ms LowLevelHooksTimeout, and Windows responds to that by silently
+        removing the hook — the exact failure this class exists to prevent.
+        """
+        if nCode == HC_ACTION and lParam:
+            try:
+                vk = int(ctypes.cast(
+                    lParam, ctypes.POINTER(_KBDLLHOOKSTRUCT)).contents.vkCode)
+                vk = _CANONICAL_VK.get(vk, vk)
+                ev = wParam
+                if ev == WM_KEYDOWN or ev == WM_SYSKEYDOWN:
+                    with self._lock:
+                        if len(self._down) < self._POOL_SIZE:
+                            self._down.add(vk)
+                elif ev == WM_KEYUP or ev == WM_SYSKEYUP:
+                    with self._lock:
+                        self._down.discard(vk)
+                # Plain int increment; no lock needed for a diagnostic counter.
+                self.event_count += 1
+                # Bounded diagnostic ring so a single press tells us WHICH keys
+                # the hook actually received (e.g. "did the Win key arrive?").
+                try:
+                    if len(self.recent) < 64:
+                        self.recent.append(("%d" % vk) + ("v" if wParam in
+                                                          (WM_KEYUP, WM_SYSKEYUP) else "^"))
+                    else:
+                        del self.recent[0]
+                        self.recent.append(("%d" % vk) + ("v" if wParam in
+                                                          (WM_KEYUP, WM_SYSKEYUP) else "^"))
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        try:
+            return _user32.CallNextHookEx(None, nCode, wParam, lParam)
+        except Exception:
+            return 0
+

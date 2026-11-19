@@ -1880,6 +1880,20 @@ class VoxManagerApp(tk.Tk):
 
         # Refresh performance metrics chips
         self._refresh_perf_display()
+
+        # BUG-23: refresh the history list automatically. It used to load only when
+        # the window was built and when "刷新" was clicked, so a window left open
+        # showed a frozen list (the DB was being written correctly all along). Only
+        # refresh while the history tab is actually visible, and skip while the user
+        # is searching (their filter would be re-applied on top anyway).
+        try:
+            if (getattr(self, "_active_tab", "") == self._tab_cats[4]
+                    and hasattr(self, "hist_list")
+                    and not self.v_hist_search.get().strip()):
+                self._hist_refresh()
+        except Exception:
+            pass
+
         # nvidia-smi is a heavyweight driver round-trip (~50-150ms of full process
         # spawn). Re-running it every 2 seconds was a classic source of visible
         # stutter while this window is open; every 30s is ample for a VRAM readout.

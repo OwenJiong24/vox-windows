@@ -613,21 +613,51 @@ def find_existing_daemon_pids():
     found = {p for p in _scan_cmdline_procs("vox_daemon.py") if _process_alive(p)}
     pf = _self_daemon_pid()
     if pf is not None:
+        # BUG-21: distinguish "this pid does not exist" from "enumeration is
+        # unavailable". The old code only looked at whether the CommandLine string
+        # was empty, so a STALE pid file left behind by a killed daemon (very common
+        # — the process object can look alive while no such cmdline exists) was
+        # treated as "enumeration unavailable -> trust the pid file". run.bat then
+        # concluded "a daemon is already running", showed its menu instead of
+        # starting one, and the user was left with NO daemon at all.
         trust_pf = True
         try:
             import subprocess as _sp
+            probe = ("$p = Get-CimInstance Win32_Process -Filter \"ProcessId={0}\" "
+                     "-ErrorAction SilentlyContinue; if ($null -eq $p) {{ "
+                     "'__VOX_NO_SUCH_PID__' }} else {{ $p.CommandLine }}").format(pf)
             cl = _sp.check_output(
-                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                 "(Get-CimInstance Win32_Process -Filter \"ProcessId={0}\" -ErrorAction "
-                 "SilentlyContinue).CommandLine".format(pf)],
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", probe],
                 text=True, encoding="utf-8", errors="replace", timeout=8).strip()
-            if cl:  # enumeration available -> require the command line to match
+            if "__VOX_NO_SUCH_PID__" in cl:
+                trust_pf = False           # pid really is gone -> ignore stale file
+            elif cl:                        # enumeration available -> require a match
                 trust_pf = "vox_daemon" in cl.lower()
+            # empty output here would mean the shell produced nothing at all, which
+            # is indistinguishable from "unavailable" -> keep the fallback.
         except Exception:
             trust_pf = True  # enumeration unavailable -> keep the pid-file fallback
         if trust_pf:
             found.add(pf)
     return sorted(found)
+
+
+def clear_stale_pid_file():
+    """Delete vox.pid when it no longer points at a live daemon.
+
+    Start-up hygiene (BUG-21): a stale pid file makes the launcher refuse to start
+    a new daemon, which presents as "Vox is running" while nothing is listening.
+    Returns True when a stale file was removed.
+    """
+    if not os.path.exists(PID_FILE):
+        return False
+    try:
+        if _self_daemon_pid() is not None:
+            return False
+        os.unlink(PID_FILE)
+        return True
+    except Exception:
+        return False
 
 
 def kill_all_vox_overlays():
@@ -2999,6 +3029,30 @@ class SmartOutput:
             log(f"⚠️ Ctrl+V 已注入，但后处理异常: {err}", "WARN")
         return bool(ok)
 
+    # Cached (rid, name) of THIS process's integrity level; None until probed.
+    # A process's integrity level cannot change while it runs, so probe once.
+    _IL_CACHE = None
+
+    @classmethod
+    def _integrity_ok_cached(cls):
+        """True unless THIS process verifiably runs below Medium.
+
+        2026-11-18 incident: UIPI silently drops SendInput from a Low-integrity
+        process when the foreground window belongs to a Medium process, and
+        SendInput still reports success — that is exactly the "pasted: true
+        but nothing landed" the user saw. This probe exists so the hint can
+        tell the truth if the daemon ever finds itself Low again (it should
+        not: the .venv interpreters were relabeled Medium). Unreadable (None)
+        counts as OK — never nag when the probe itself fails.
+        """
+        if cls._IL_CACHE is None:
+            try:
+                cls._IL_CACHE = _win32.integrity_level()
+            except Exception:
+                cls._IL_CACHE = (None, "unknown")
+        rid = cls._IL_CACHE[0]
+        return rid is None or rid >= 0x2000
+
     # Terminal / emulator targets where Ctrl+V frequently does NOT inject text
     # (they need Ctrl+Shift+V / Shift+Ins / auto-read the clipboard). See complaint #9.
     _TERMINAL_MARKERS = (
@@ -3121,6 +3175,13 @@ class SmartOutput:
             if res["pasted"] and _win32.last_error():
                 extra = _win32.last_error()
                 res["hint"] = (res["hint"] + " · " + extra).strip(" ·")
+            # UIPI tripwire (2026-11-18): below Medium, SendInput can be
+            # silently swallowed while still reporting success. Surface that
+            # possibility instead of letting the user find an empty cursor.
+            if res["pasted"] and not cls._integrity_ok_cached():
+                warn = ("⚠️ 当前进程为 Low 完整性：自动粘贴可能已被系统拦截，"
+                        "内容已复制到剪贴板，请手动 Ctrl+V")
+                res["hint"] = (warn + " · " + res["hint"]).strip(" ·") if res["hint"] else warn
 
         if res["copied"] and safe_restore and orig_text and orig_text != text:
             cls._schedule_restore(orig_text)

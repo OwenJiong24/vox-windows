@@ -15,9 +15,14 @@ if errorlevel 1 goto :DEP_WARNING
 
 :RUN_VOX
 rem The project venv is authoritative: it is where requirements.txt was installed.
-rem This used to prefer a global system interpreter, which lacked the project's
-rem dependencies — so clipboard writes and Ctrl+V failed silently while
+rem This used to prefer a global system interpreter that lacked pywin32 --
+rem so every clipboard write and Ctrl+V injection failed silently while
 rem transcription kept working. Never prefer a global interpreter over the venv.
+rem
+rem IMPORTANT: keep this file pure ASCII with CRLF line endings. A single
+rem non-ASCII character (e.g. an em-dash) makes cmd decode the byte stream with
+rem the wrong code page, which silently shifts every following line and breaks
+rem "cd /d" -- that exact bug made run.bat unable to start the daemon at all.
 set "PY=.venv\Scripts\python.exe"
 if not exist "%PY%" set "PY=python"
 "%PY%" check_env.py %*
@@ -27,7 +32,7 @@ goto :EOF
 :VENV_ERROR
 echo.
 echo ============================================================
-echo [Error] Failed to initialize virtual environment.
+echo [Error] Failed to initialize Python virtual environment.
 echo Please ensure Python 3.10+ is installed and on your PATH.
 echo ============================================================
 echo.

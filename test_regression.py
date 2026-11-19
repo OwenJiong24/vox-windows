@@ -930,6 +930,124 @@ def test_20261118_fixes():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_keyboard_watcher():
+    section("21. 自建全局键盘监听 (BUG-19: 焦点无关 + 自愈)")
+    import ctypes
+    import vox_win32 as w
+
+    watcher = w.KeyboardWatcher()
+    try:
+        check("start() 装上钩子", watcher.start() is True,
+              f"installs={watcher.install_count()}")
+        check("is_alive() 为真", watcher.is_alive() is True)
+        check("初始无按键", watcher.keys_all_down([(0x11,), (0x5B, 0x5C)]) is False)
+
+        groups = w.resolve_hotkey_vks(["control", "win"])
+        check("Ctrl+Win 解析为 [(17,),(91,92)]", groups == [(0x11,), (0x5B, 0x5C)], str(groups))
+
+        # Deterministic state-machine assertion: drive the hook callback directly.
+        # (Injecting synthetic input and hoping the OS hook sees it is flaky in a
+        # non-interactive test process, so that is only reported as INFO below.)
+        def _fire(vk, down, extended_vk=False):
+            st = w._KBDLLHOOKSTRUCT()
+            st.vkCode = vk
+            st.scanCode = 0
+            st.flags = 0
+            st.time = 0
+            st.dwExtraInfo = 0
+            return watcher._hook_proc(
+                0, 0x0100 if down else 0x0101, ctypes.pointer(st))
+
+        _fire(0xA2, True)          # physical left ctrl arrives as 0xA2
+        _fire(0x5B, True)
+        check("Ctrl+Win 按下被识别", watcher.keys_all_down(groups) is True,
+              str(sorted(watcher.snapshot())))
+        check("0xA2 已归一化为 0x11", watcher.is_down(0x11) is True)
+
+        _fire(0x5B, False)
+        check("松开 Win 后组合解除", watcher.keys_all_down(groups) is False)
+        _fire(0xA2, False)
+        check("全部松开后状态清空", watcher.snapshot() == set(),
+              str(sorted(watcher.snapshot())))
+
+        # Best-effort: does the OS hook observe synthetic input right now?
+        try:
+            w._send([w._key_event(0x11, keyup=False), w._key_event(0x5B, keyup=False)])
+            time.sleep(0.2)
+            injected_seen = watcher.keys_all_down(groups)
+        except Exception:
+            injected_seen = None
+        finally:
+            try:
+                w._send([w._key_event(0x5B, keyup=True), w._key_event(0x11, keyup=True)])
+            except Exception:
+                pass
+        print(f"  [INFO] OS 钩子是否看到合成输入: {injected_seen} "
+              f"(非交互测试进程中可能为 False，由实机验证)")
+
+        # Self-healing: after a stop, watchdog must bring it back.
+        before = watcher.install_count()
+        watcher.stop()
+        check("stop() 后不再 alive", watcher.is_alive() is False)
+        watcher.watchdog()
+        check("watchdog() 自动重装", watcher.is_alive() is True,
+              f"installs {before} -> {watcher.install_count()}")
+
+        # The callback must never raise out of the OS hook.
+        try:
+            watcher._hook_proc(0, 0x0100, None)
+            watcher._hook_proc(0, 0x0100, 0)
+            watcher._hook_proc(999, 0x0100, 0)
+            ok_proc = True
+        except Exception:
+            ok_proc = False
+        check("钩子回调对畸形入参不抛异常", ok_proc)
+    finally:
+        watcher.stop()
+
+
+def test_hotkey_registration_guard():
+    section("22. 系统热键注册守卫 (2026-11-18 纯修饰键事故)")
+    import vox_win32 as w
+
+    # The 19:30 incident: Ctrl+Alt "registered successfully" via a
+    # modifier-as-vk trick and then NEVER fired, while the daemon suppressed
+    # its hook path — the hotkey was completely dead. Such chords must now be
+    # refused with an explicit error instead of registered.
+    mods, vk, err = w.resolve_register_hotkey(["control", "alt"])
+    check("Ctrl+Alt 纯修饰组合被拒绝", err is not None and vk is None, str(err))
+    mods, vk, err = w.resolve_register_hotkey(["control"])
+    check("单修饰键被拒绝", err is not None, str(err))
+    mods, vk, err = w.resolve_register_hotkey(["win", "ctrl"])
+    check("Win+Ctrl 纯修饰组合被拒绝", err is not None, str(err))
+
+    # The modifier-as-key trap must be gone for good.
+    check("_MOD_AS_KEY 陷阱已删除", not hasattr(w, "_MOD_AS_KEY"))
+
+    # Real-key chords must still resolve.
+    mods, vk, err = w.resolve_register_hotkey(["control", "win", "z"])
+    check("Ctrl+Win+Z 可解析",
+          err is None and mods == (w.MOD_CONTROL | w.MOD_WIN) and vk == 0x5A,
+          f"mods={mods} vk={vk} err={err}")
+    mods, vk, err = w.resolve_register_hotkey(["control", "alt", "f9"])
+    check("Ctrl+Alt+F9 可解析",
+          err is None and vk == 0x78, f"vk={vk} err={err}")
+
+    # UIPI tripwire: SmartOutput must know whether it runs below Medium.
+    import vox_core as c
+    c.SmartOutput._IL_CACHE = None  # force a fresh probe
+    ok1 = c.SmartOutput._integrity_ok_cached()
+    cached = c.SmartOutput._IL_CACHE
+    ok2 = c.SmartOutput._integrity_ok_cached()
+    check("完整性探测返回 bool 且结果被缓存",
+          isinstance(ok1, bool) and ok1 == ok2 and cached is not None,
+          f"ok={ok1} cache={cached}")
+    # Simulated Low must flip the verdict (rid 0x1000 = Low).
+    c.SmartOutput._IL_CACHE = (0x1000, "Low")
+    check("Low 完整性时绊线报警", c.SmartOutput._integrity_ok_cached() is False)
+    c.SmartOutput._IL_CACHE = None  # don't poison later tests
+
+
 def main():
     ap = argparse.ArgumentParser(description="Vox regression tests")
     ap.add_argument("--inject", action="store_true",
@@ -965,6 +1083,8 @@ def main():
     test_streaming_worker_is_incremental()
     test_backup_wav_is_incrementally_valid()
     test_20261118_fixes()
+    test_keyboard_watcher()
+    test_hotkey_registration_guard()
     if args.daemon:
         test_daemon()
     else:

@@ -33,6 +33,14 @@ OVERLAY_STATE_FILE = os.path.join(SCRIPT_DIR, "overlay_state.json")
 
 def get_daemon_pid():
     """Returns alive PID of vox_daemon if running, else None."""
+    # BUG-21: clear a stale pid file FIRST. Otherwise a pid left behind by a killed
+    # daemon makes this function (and find_existing_daemon_pids) believe Vox is
+    # already running, so run.bat shows its menu instead of starting anything and
+    # the user ends up with no daemon at all.
+    try:
+        core.clear_stale_pid_file()
+    except Exception:
+        pass
     if os.path.exists(core.PID_FILE):
         try:
             with open(core.PID_FILE, "r", encoding="utf-8") as f:

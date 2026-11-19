@@ -199,6 +199,103 @@ def _norm_kb_name(name):
     return _KB_NAME_ALIASES.get(n, n)
 
 
+def _harden_keyboard_library():
+    """Stop the `keyboard` package from silently killing its own dispatch thread.
+
+    WHY (BUG-19): the package's dispatch loop is
+
+        def process(self):
+            while True:
+                event = self.queue.get()
+                if self.pre_process_event(event):
+                    self.invoke_handlers(event)
+                self.queue.task_done()
+
+    with no exception guard, and invoke_handlers' error path is
+    `traceback.print_exc()`. Under pythonw.exe sys.stderr is None, so print_exc()
+    raises AttributeError *inside the handler* and that escapes the unguarded
+    loop. The dispatch thread dies; the OS hook keeps filling the queue; the
+    held-key set freezes; the hotkey stops responding forever with no log.
+
+    This replaces `process` with a guarded version (the thread can never exit)
+    and makes the error path a no-op instead of a print. Idempotent, best-effort.
+    """
+    try:
+        from keyboard import _generic
+    except Exception:
+        return False
+    try:
+        if getattr(_generic.GenericListener.process, "_vox_hardened", False):
+            return True
+
+        def _safe_process(self):
+            while True:
+                try:
+                    event = self.queue.get()
+                except Exception:
+                    time.sleep(0.02)
+                    continue
+                try:
+                    if self.pre_process_event(event):
+                        self.invoke_handlers(event)
+                except Exception:
+                    pass          # never let one bad event kill the thread
+                finally:
+                    try:
+                        self.queue.task_done()
+                    except Exception:
+                        pass
+
+        _safe_process._vox_hardened = True
+        _generic.GenericListener.process = _safe_process
+
+        # Belt and braces: neutralise the printing error path for any code that
+        # still calls it (this is what actually raises under pythonw).
+        orig_invoke = _generic.GenericListener.invoke_handlers
+
+        def _safe_invoke(self, event):
+            for handler in self.handlers:
+                try:
+                    if handler(event):
+                        return 1
+                except Exception:
+                    pass
+            return None
+
+        _safe_invoke._vox_hardened = True
+        _generic.GenericListener.invoke_handlers = _safe_invoke
+        return True
+    except Exception:
+        return False
+
+
+def _keyboard_dispatch_alive():
+    """True when the package's dispatch thread is still running."""
+    try:
+        import keyboard as _kb
+        L = getattr(_kb, "_listener", None)
+        if L is None or not getattr(L, "listening", False):
+            return False
+        t = getattr(L, "processing_thread", None)
+        return bool(t is not None and t.is_alive())
+    except Exception:
+        return False
+
+
+def _restart_keyboard_dispatch():
+    """Restart the package's listener if its dispatch thread died."""
+    try:
+        import keyboard as _kb
+        L = getattr(_kb, "_listener", None)
+        if L is None:
+            return False
+        L.listening = False
+        L.start_if_necessary()
+        return True
+    except Exception:
+        return False
+
+
 class VoxDaemon:
     # Minimum interval between overlay_state.json writes (s). The PortAudio callback
     # fires ~10-100ms per block and used to rewrite the whole file on the audio thread
@@ -243,6 +340,26 @@ class VoxDaemon:
         self._hook = None
         self._hook_ready = False
         self._hook_combo_down = False
+        # BUG-19 (2026-11-18): self-owned, self-healing keyboard hook. The
+        # `keyboard` package dispatches callbacks from a single thread whose
+        # error path calls traceback.print_exc(); under pythonw (sys.stderr is
+        # None) that raises again and kills the dispatch thread permanently,
+        # after which the hotkey never fires again. This watcher replaces it on
+        # the critical path. See vox_win32.KeyboardWatcher for the full story.
+        self._kb_watch = None
+        self._last_hook_log = ""
+        self._last_pressed_state = False
+        # BUG-22: Windows RegisterHotKey. The SYSTEM owns the chord and posts
+        # WM_HOTKEY to our thread, so it works regardless of the foreground
+        # window AND regardless of this process's integrity level. It is an
+        # OPT-IN path (hotkey.register_combo) for real-key chords only; the
+        # default trigger is the keyboard hook below, which needs the daemon
+        # at Medium integrity — guaranteed since the 2026-11-18 workspace
+        # label fix (the .venv interpreters used to inherit a Low MICL, which
+        # is what blinded the hook in every app except Vox's own windows).
+        self._hotkey_reg = None
+        self._reg_fires = 0
+        self._use_register = False
         self._lock_socket = None
         self._last_preview_text = ""
         # Per-take generation id. Background workers (hot-backup, streaming) capture
@@ -452,6 +569,18 @@ class VoxDaemon:
 
     # ── Health & Stats ───────────────────────────────────────────
     def update_health(self):
+        # BUG-20: report our OWN integrity level (reading it from another
+        # process is unreliable under UIPI). "Low"/"Untrusted" means the hook
+        # cannot see other apps' keystrokes and SendInput paste is silently
+        # blocked by UIPI. Root cause found 2026-11-18: the .venv interpreters
+        # inherited a Low mandatory label from the workspace root, so EVERY
+        # launch path was Low. After the relabel this must read "Medium";
+        # if it ever reads Low again, check with
+        # `icacls .venv\Scripts\pythonw.exe` (see docs/10_INTEGRITY_LABEL_INCIDENT.md).
+        try:
+            _il_rid, _il_name = _win32.integrity_level()
+        except Exception:
+            _il_rid, _il_name = None, "unknown"
         data = {
             "pid": os.getpid(),
             "state": self.state.lower(),
@@ -464,6 +593,36 @@ class VoxDaemon:
             "has_groq_key": bool(self.chain._resolve_api_key()),
             "hotkey_combo": self._active_combo.upper(),
             "hotkey_hook_ready": bool(self._hook_ready),
+            # BUG-19: the primary hotkey source's real health (survives hook death).
+            "hotkey_watcher_alive": bool(
+                self._kb_watch is not None and self._kb_watch.is_alive()),
+            "hotkey_watcher_installs": (
+                self._kb_watch.install_count() if self._kb_watch is not None else 0),
+            "hotkey_watcher_events": (
+                self._kb_watch.event_count if self._kb_watch is not None else -1),
+            # BUG-19: is the keyboard package's dispatch thread still consuming
+            # events? This is the exact thread whose silent death broke the hotkey.
+            "keyboard_dispatch_alive": _keyboard_dispatch_alive() if _KB_OK else False,
+            # BUG-20: our own integrity level. "Low"/"Untrusted" means the hook
+            # physically cannot see other apps' keystrokes and paste is UIPI-
+            # blocked. Fixed 2026-11-18 by relabeling the venv interpreters;
+            # must read "Medium" no matter who started the daemon.
+            "integrity": _il_name,
+            "integrity_ok": bool(_il_rid is not None and _il_rid >= 0x2000),
+            # 2026-11-18: True when the configured preferred_device could not
+            # be found and we fell back to another mic. Burying this in the
+            # log made the user speak into the wrong microphone for weeks.
+            "mic_fallback": bool(getattr(self, "_mic_fallback", False)),
+            # BUG-22: the system-level hotkey is what actually works.
+            "register_hotkey": (self._hotkey_reg.combo
+                                if self._hotkey_reg is not None else ""),
+            "register_hotkey_active": bool(self._use_register),
+            "register_hotkey_fires": (self._hotkey_reg.fire_count
+                                      if self._hotkey_reg is not None else -1),
+            "register_hotkey_error": (self._hotkey_reg.error
+                                      if self._hotkey_reg is not None else "not started"),
+            "watcher_recent": (list(self._kb_watch.recent)
+                               if self._kb_watch is not None else []),
             "updated_at": datetime.now().isoformat(),
         }
         with self._io_lock:
@@ -1206,40 +1365,176 @@ class VoxDaemon:
             pass
 
     # ── Main Event & Watch Loop ───────────────────────────────────
+    def _hotkey_source(self):
+        """Which detection path currently reports the chord as held (diagnostics).
+
+        Returns one of "watcher", "gas", "hook", "kb", "none". Knowing WHICH source
+        fired is what separates "the OS never delivered the keys" (UIPI) from "we saw
+        the keys but did not act on them".
+        """
+        groups = self._combo_vks
+        if not (groups and all(groups)):
+            return "none"
+        try:
+            if self._kb_watch is not None and self._kb_watch.is_alive() \
+                    and self._kb_watch.keys_all_down(groups):
+                return "watcher"
+        except Exception:
+            pass
+        try:
+            if _win32.keys_all_down(groups):
+                return "gas"
+        except Exception:
+            pass
+        try:
+            if self._combo_down_via_hook():
+                return "hook"
+        except Exception:
+            pass
+        if _KB_OK:
+            try:
+                if keyboard.is_pressed(self._active_combo):
+                    return "kb"
+            except Exception:
+                pass
+        return "none"
+
+    def _setup_register_hotkey(self):
+        """Register a system-level hotkey (BUG-22), or stay on the hook path.
+
+        `hotkey.register_combo` is an OPT-IN system hotkey. Rules learned the
+        hard way (2026-11-18):
+        * RegisterHotKey needs a real (non-modifier) key. A pure modifier chord
+          such as Ctrl+Alt is REFUSED by resolve_register_hotkey — it registers
+          "successfully" but never fires, and while a system hotkey is active
+          this daemon suppresses the hook path, i.e. one bogus registration
+          kills the hotkey completely.
+        * No silent chord substitution. The previous behavior tried a list of
+          "common free chords" (control+alt+f9, ...) when the configured one
+          failed — that changes the user's hotkey without consent and without
+          any way to know what actually got registered. Fail loudly instead and
+          stay on the hook.
+        """
+        if self._hotkey_reg is not None:
+            try:
+                self._hotkey_reg.stop()
+            except Exception:
+                pass
+            self._hotkey_reg = None
+        self._use_register = False
+
+        hk = self.cfg.get("hotkey", {}) or {}
+        wanted = str(hk.get("register_combo") or "").strip()
+        if not wanted:
+            # Empty = disabled on purpose; the keyboard hook (KeyboardWatcher,
+            # BUG-19) is the trigger. With the daemon at Medium integrity —
+            # the default since the 2026-11-18 label fix — the hook sees
+            # keystrokes in every normal app.
+            log("系统级热键未启用（register_combo 为空）→ 使用键盘钩子监听 "
+                f"[{self._active_combo.upper()}]", "INFO")
+            return False
+
+        tokens = [t.strip().lower() for t in wanted.split("+") if t.strip()]
+        mods, vk, err = _win32.resolve_register_hotkey(tokens)
+        if err:
+            log(f"系统热键 {wanted} 不可用: {err}", "WARN")
+            log(f"→ 继续使用键盘钩子监听 [{self._active_combo.upper()}]；"
+                "如需系统热键请在配置里换一个带真实按键的组合", "WARN")
+            return False
+        reg = _win32.HotkeyRegistry()
+        # MOD_NOREPEAT: holding the chord must fire ONCE, not autofire. Without
+        # it a held key produced a burst of WM_HOTKEY messages, which toggled
+        # recording on/off repeatedly and left a trail of "too_short" takes.
+        if reg.start(mods | _win32.MOD_NOREPEAT, vk, combo=wanted):
+            self._hotkey_reg = reg
+            self._reg_fires = reg.fire_count
+            self._use_register = True
+            log(f"✅ 全局热键已注册: [{wanted.upper()}] "
+                f"(系统级，任何窗口前台都有效；按一下开始，再按一下结束)", "INFO")
+            return True
+        log(f"热键 {wanted} 注册失败: {reg.error}", "WARN")
+        log(f"⚠️ 未能注册系统级热键；继续使用键盘钩子监听 [{self._active_combo.upper()}]", "WARN")
+        return False
+
+    def _on_register_hotkey(self):
+        """A WM_HOTKEY arrived: toggle recording. Never called from a hook thread."""
+        try:
+            if self.state == "IDLE":
+                self._start_recording(mode="RECORDING_TOGGLE",
+                                      hint="免手持录音中 (再按一次结束)")
+            elif "RECORDING" in self.state:
+                self._finish_recording()
+        except Exception as e:
+            log(f"系统热键处理异常: {e}", "ERROR")
+
     def _is_hotkey_pressed(self):
         """True while the whole hotkey chord is physically held.
 
-        Two independent sources, because neither alone is sufficient here:
+        Three sources, in order of reliability:
 
-        * `GetAsyncKeyState` (one syscall, no allocation) is the fast path — but
-          MEASURED on this machine it reports nothing while another process's window is
-          in the foreground, which is what made the hotkey appear to work only when the
-          Vox window was focused.
-        * the `keyboard` library's global WH_KEYBOARD_LL hook is focus-independent, so
-          its held-key set is consulted whenever the fast path says "not pressed".
+        1. `self._kb_watch` — our OWN WH_KEYBOARD_LL hook. Focus-independent and
+           self-healing; this is the primary source (BUG-19).
+        2. `GetAsyncKeyState` — one syscall, no allocation, but MEASURED on this
+           machine to report nothing while some other process's window is in the
+           foreground.
+        3. the `keyboard` package — kept only as a last resort; its dispatch
+           thread can die silently under pythonw (see KeyboardWatcher).
         """
         groups = self._combo_vks
-        if groups and all(groups):
-            if _win32.keys_all_down(groups):
+        if not (groups and all(groups)):
+            # Unsupported combo (unknown token): fall back to the library.
+            if not _KB_OK:
+                return False
+            try:
+                return keyboard.is_pressed(self._active_combo)
+            except Exception:
+                return False
+
+        watcher = self._kb_watch
+        if watcher is not None and watcher.is_alive():
+            if watcher.keys_all_down(groups):
                 return True
-            # The low-level hook is the focus-independent source. Keep the
-            # keyboard package's own pressed-state as a second read of the same
-            # global listener so a missed/custom event-name normalization cannot
-            # make a valid hotkey appear permanently released.
-            if self._combo_down_via_hook():
-                return True
-            if _KB_OK:
-                try:
-                    return bool(keyboard.is_pressed(self._active_combo))
-                except Exception as e:
-                    log(f"全局热键状态读取失败: {e}", "DEBUG")
-            return False
-        if not _KB_OK:
-            return False
-        try:
-            return keyboard.is_pressed(self._active_combo)
-        except Exception:
-            return False
+
+        if _win32.keys_all_down(groups):
+            return True
+
+        if self._combo_down_via_hook():
+            return True
+
+        if _KB_OK:
+            try:
+                return bool(keyboard.is_pressed(self._active_combo))
+            except Exception:
+                pass
+        return False
+
+    def _hotkey_health_check(self):
+        """Reinstall hooks if their threads died (BUG-19).
+
+        Two independent things are watched:
+          * our own `KeyboardWatcher` pump thread;
+          * the `keyboard` package's dispatch thread — hardened so it should never
+            die, but restarted here if it ever does.
+        Called from `watch_loop`, never from a hook callback.
+        """
+        watcher = self._kb_watch
+        if watcher is not None:
+            try:
+                if not watcher.is_alive() and watcher.watchdog():
+                    log(f"🩹 自建键盘钩子已自动重装 (第 {watcher.install_count()} 次)",
+                        "WARN")
+                    self.update_health()
+            except Exception as e:
+                log(f"键盘 hook 自检异常: {e}", "DEBUG")
+
+        if _KB_OK:
+            try:
+                if not _keyboard_dispatch_alive():
+                    if _restart_keyboard_dispatch():
+                        log("🩹 keyboard 库分发线程已重启", "WARN")
+                        self.update_health()
+            except Exception as e:
+                log(f"keyboard 分发线程自检异常: {e}", "DEBUG")
 
     def _is_esc_pressed(self):
         return _win32.is_key_down(_win32.VK_ESCAPE)
@@ -1248,22 +1543,16 @@ class VoxDaemon:
         return _win32.is_key_down(_win32.VK_RETURN)
 
     def _on_kb_event(self, event):
-        """Track the physically held key set from the GLOBAL hook.
+        """Track the physically held key set from the `keyboard` library's hook.
 
-        This hook was already installed but only used to notice "the user typed another
-        key during a single-modifier combo". It is the reliable source for hotkey state:
-        `WH_KEYBOARD_LL` is delivered system-wide regardless of which window has focus,
-        whereas `GetAsyncKeyState` — measured on this machine — reported nothing at all
-        while a Chrome window was in the foreground:
+        IMPORTANT (BUG-19): this callback runs on the library's dispatch thread,
+        whose loop has NO exception guard and whose error path calls
+        traceback.print_exc() — fatal under pythonw (sys.stderr is None). So:
 
-            05:29:14  松开  Ctrl=False LWin=False  前台=Chrome        <- 没有记录到按下
-            05:30:58  按下  Ctrl=True  LWin=True   前台=Vox 管理控制中心
-            05:31:21  按下  Ctrl=True  LWin=True   前台=Vox 管理控制中心
-
-        That is exactly the reported symptom: the hotkey only worked while the Vox window
-        itself was in front.
+          * NO logging, file I/O or anything else that can raise or block here.
+            Any diagnostic is emitted from watch_loop instead (see _log_hook_flag).
+          * every step is wrapped so this callback can never raise.
         """
-        was_combo_down = self._hook_combo_down
         try:
             name = _norm_kb_name(event.name)
             if event.event_type == "down":
@@ -1271,22 +1560,27 @@ class VoxDaemon:
             else:
                 self._kb_down.discard(name)
             self._hook_combo_down = self._combo_down_via_hook()
-            if self._hook_combo_down != was_combo_down:
-                log(
-                    f"全局键盘 hook 捕获热键组合 {'按下' if self._hook_combo_down else '松开'}: "
-                    f"{self._active_combo.upper()} (事件={event.event_type}:{event.name})",
-                    "DEBUG",
-                )
         except Exception:
             pass
         # Detect if another key is typed when hotkey is a single modifier (e.g. user typed Shift+A)
-        if self._is_single_modifier and event.event_type == "down":
-            try:
-                name = (event.name or "").lower()
-                if name not in self._combo_tokens and len(name) == 1:
+        try:
+            if self._is_single_modifier and event.event_type == "down":
+                raw = (event.name or "").lower()
+                if raw not in self._combo_tokens and len(raw) == 1:
                     self._other_key_pressed_during_combo = True
-            except Exception:
-                pass
+        except Exception:
+            pass
+
+    def _log_hook_flag(self):
+        """Emit hook state transitions from the MAIN loop, never the hook thread."""
+        try:
+            flag = "按下" if self._hook_combo_down else "松开"
+            if flag != self._last_hook_log:
+                self._last_hook_log = flag
+                log(f"全局键盘 hook 捕获热键组合 {flag}: {self._active_combo.upper()}",
+                    "DEBUG")
+        except Exception:
+            pass
 
     def _combo_down_via_hook(self):
         """True while every hotkey token is held, according to the global hook.
@@ -1409,6 +1703,28 @@ class VoxDaemon:
         if os.path.exists(REC_BACKUP_FILE):
             log(f"🛡️ 检测到上次会话遗留的录音热备份: {REC_BACKUP_FILE} (上次录音中断，音频已保留)", "WARN")
 
+        # ── BUG-19: harden the keyboard package BEFORE installing its hook ──
+        # Its dispatch loop has no exception guard and its error path calls
+        # traceback.print_exc(), which raises under pythonw (sys.stderr is None)
+        # and kills the thread permanently — the hotkey then never fires again.
+        _harden_keyboard_library()
+
+        # ── BUG-22: system-level hotkey FIRST — the reliable path ──
+        self._setup_register_hotkey()
+
+        # ── BUG-19: primary hotkey source — our own self-healing hook ──
+        # Started BEFORE the library hook so the hotkey works even if the
+        # `keyboard` package is missing or its dispatch thread dies.
+        try:
+            self._kb_watch = _win32.KeyboardWatcher()
+            if self._kb_watch.start():
+                log("✅ 自建全局键盘监听已启动（焦点无关 + 自愈）", "INFO")
+            else:
+                log("⚠️ 自建全局键盘监听启动失败；将退回 GetAsyncKeyState 兜底", "WARN")
+        except Exception as e:
+            self._kb_watch = None
+            log(f"自建全局键盘监听异常: {e}", "WARN")
+
         if _KB_OK:
             try:
                 self._hook = keyboard.hook(self._on_kb_event)
@@ -1450,6 +1766,15 @@ class VoxDaemon:
                     log("🧹 收到 offload 指令，正在卸载 GPU 上的本地音频模型...", "INFO")
                     threading.Thread(target=self._offload_worker, name="vox-offload", daemon=True).start()
 
+                # BUG-19: once per second, make sure the keyboard hook is still
+                # alive and reinstall it if the pump died. This is what prevents
+                # "the hotkey silently stopped working forever".
+                self._hotkey_health_check()
+                self._log_hook_flag()
+                # Refresh health once a second so hook/dispatch liveness is
+                # observable without waiting for a state change.
+                self.update_health()
+
             # Enforce audio.max_recording_seconds. The key existed in config.json but
             # NOTHING ever read it, so a forgotten hands-free take grew the audio
             # buffer without bound — the single most likely source of the memory
@@ -1462,6 +1787,37 @@ class VoxDaemon:
                     self._finish_recording()
 
             pressed = self._is_hotkey_pressed()
+            # BUG-22: when the system-level hotkey is active it is the ONLY trigger.
+            # The hook/GetAsyncKeyState polling stays disabled on purpose — otherwise
+            # a single physical press would fire both paths and the take would start
+            # and stop immediately.
+            if self._use_register and self._hotkey_reg is not None:
+                fires = self._hotkey_reg.fire_count
+                if fires != self._reg_fires:
+                    self._reg_fires = fires
+                    log(f"🔑 系统热键触发 (WM_HOTKEY, 累计 {fires} 次)", "INFO")
+                    self._on_register_hotkey()
+                pressed = False
+            # BUG-19 diagnostics: log the exact press/release EDGE together with the
+            # winning source and the foreground window. One press is then enough to
+            # tell "OS never delivered the keys" from "we saw them but ignored them".
+            try:
+                if pressed != self._last_pressed_state:
+                    self._last_pressed_state = pressed
+                    if pressed:
+                        src = self._hotkey_source()
+                        ec = (self._kb_watch.event_count
+                              if self._kb_watch is not None else -1)
+                        watch_ok = bool(self._kb_watch is not None
+                                        and self._kb_watch.is_alive())
+                        mouse = self._left_mouse_pressed()
+                        log(f"🔑 热键按下 [源={src}] watcher_alive={watch_ok} "
+                            f"watcher_events={ec} 左键={mouse} 前景={_win32.foreground_window_title()[:40]!r}",
+                            "INFO")
+                    else:
+                        log("🔑 热键松开", "DEBUG")
+            except Exception:
+                pass
             # B6: reset each iteration. Set to True when a toggle-mode finish must wait for
             # hotkey release; that wait is performed AFTER the state lock is released below.
             release_wait = False
@@ -1580,6 +1936,17 @@ class VoxDaemon:
         # Preflight audio device
         dev_idx, dev_name = self.pipeline.resolve_device(self.cfg.get("audio", {}).get("preferred_device"))
         log(f"🎙️ 麦克风就绪: [{dev_idx}] {dev_name}")
+        # 2026-11-18: a silently ignored preferred_device produced weeks of
+        # near-silent takes from the wrong mic ("too_short" / hallucinations)
+        # while the user spoke into the configured one. Make the fallback loud.
+        pref_dev = self.cfg.get("audio", {}).get("preferred_device")
+        self._mic_fallback = False
+        if isinstance(pref_dev, str) and pref_dev.strip() \
+                and pref_dev.strip().lower() not in ("none", "null", "auto"):
+            if pref_dev.strip().lower() not in (dev_name or "").lower():
+                self._mic_fallback = True
+                log(f"⚠️ 配置的麦克风 {pref_dev!r} 当前不可用，已回退到 "
+                    f"[{dev_idx}] {dev_name}；请插回设备或在 GUI 重新校准", "WARN")
         # Seed the hot-plug baseline so _device_watch only fires on actual changes.
         self._bound_device = {"index": dev_idx, "friendly_name": dev_name}
 
@@ -1611,6 +1978,21 @@ class VoxDaemon:
                 keyboard.unhook(self._hook)
             except Exception:
                 pass
+        # BUG-19: release our own hook + pump thread.
+        if self._kb_watch is not None:
+            try:
+                self._kb_watch.stop()
+            except Exception:
+                pass
+            self._kb_watch = None
+        # BUG-22: release the system hotkey.
+        if self._hotkey_reg is not None:
+            try:
+                self._hotkey_reg.stop()
+            except Exception:
+                pass
+            self._hotkey_reg = None
+        self._use_register = False
         self.kill_overlay()
         if self.tray:
             try:

@@ -104,11 +104,13 @@ run.bat          :: preflight + start the daemon (tray + floating pill)
 manager.bat      :: open the settings & diagnostics console
 ```
 
-Default hotkey is `Control+Win` (configurable). Highlights of the config:
+Default hotkey in `config.example.json` is `Control+Win` (configurable; the shipped
+example uses `control+win`, a real-key chord). Highlights of the config:
 
 | Key | Meaning |
 |---|---|
-| `hotkey.combo` | Hotkey tokens, e.g. `control+win` |
+| `hotkey.combo` | Hotkey tokens for the keyboard-hook path, e.g. `control+alt` |
+| `hotkey.register_combo` | Optional system-level (`RegisterHotKey`) chord; **must contain a real key** (e.g. `control+win+z`). Pure-modifier chords are rejected because Windows registers them but never dispatches them. Empty = hook path. |
 | `hotkey.mode` | `adaptive` (hold/tap), `hold_only`, or `toggle_only` |
 | `engine_priority` | Ordered fallback slots: `groq-l3`, `groq-turbo`, `mimo`, `sensevoice-cpu`, `sensevoice-cuda` |
 | `output_method` | `smart_paste` (Ctrl+V) or `clipboard_only` |
@@ -142,10 +144,52 @@ renders what it reads from `overlay_state.json`.
 .venv\Scripts\python.exe test_regression.py
 ```
 
-Offline and safe by default. `--inject` tests real Ctrl+V (types a space into the
-focused window) and `--daemon` runs a daemon smoke test (grabs the global hotkey);
-both are opt-in. `test_suite.py` is an end-to-end suite that calls live ASR APIs and
-consumes quota.
+Offline and safe by default (134 assertions, including a guard that refuses to
+register pure-modifier system hotkeys). `--inject` tests real Ctrl+V (types a space
+into the focused window) and `--daemon` runs a daemon smoke test (grabs the global
+hotkey); both are opt-in. `test_suite.py` is an end-to-end suite that calls live ASR
+APIs and consumes quota.
+
+## Troubleshooting
+
+**Hotkey only works while a Vox window is focused / "pasted" but nothing appears at
+the cursor.** Both symptoms share one cause: the daemon is running at **Low
+integrity**. A low-integrity process cannot receive keyboard-hook events destined
+for normal (medium-integrity) applications, and its injected Ctrl+V is silently
+dropped by User Interface Privilege Isolation — while `SendInput` still reports
+success. Check `integrity` in the daemon's health file: it must be `Medium`. If it
+says `Low`, the Python interpreter in `.venv` carries a Low mandatory label;
+relabel it (and the project directory) to Medium, then restart the daemon:
+
+```bat
+icacls .venv\Scripts\python.exe  /setintegritylevel Medium
+icacls .venv\Scripts\pythonw.exe /setintegritylevel Medium
+icacls .venv\Scripts             /setintegritylevel "(OI)(CI)Medium"
+icacls .venv                     /setintegritylevel "(OI)(CI)Medium"
+icacls .                         /setintegritylevel "(OI)(CI)Medium"
+```
+
+Integrity is determined by the *lower* of the launcher's token and the executable's
+own label — so this can affect a daemon started by hand or by an agent just as much
+as one started by `run.bat`.
+
+**System hotkey registered "successfully" but never fires.** `RegisterHotKey`
+accepts pure-modifier chords such as `Ctrl+Alt` and then never dispatches them.
+Use a chord with a real key (`control+win+z`) in `hotkey.register_combo`, or leave it
+empty to use the default keyboard-hook path. Vox now rejects impossible chords with
+an explicit warning instead of silently falling back.
+
+**No text / garbled output.** Check the `mic_fallback` field in the health file and
+the daemon log: when the configured `audio.preferred_device` is unavailable, Vox
+warns loudly and falls back to another microphone. Very short or silent takes are
+deliberately discarded to prevent Whisper hallucination artifacts being pasted.
+
+**Config changes not applied.** `config.json` hot-reloads in about a second; code
+changes require a daemon restart. Make sure only one daemon instance is running.
+
+**`run.bat` fails with "command not found" style errors.** The batch file must stay
+pure ASCII with CRLF line endings — a single non-ASCII character can make `cmd`
+misparse the whole script.
 
 ## Security & privacy
 
